@@ -14,7 +14,8 @@ const { v4: uuidv4 } = require("uuid");
 const cors = require("cors");
 
 const app = express();
-const PORT = 9000;
+const PORT = process.env.PORT || 9000;
+const SOCKET_PORT = process.env.SOCKET_PORT || 9002;
 
 const io = new Server({ cors: "*" });
 
@@ -23,22 +24,22 @@ app.use(cors());
 
 const kafka = new Kafka({
   clientId: `api-server`,
-  brokers: ["kafka-1d8586de-aadityadeopandeyy-3721.f.aivencloud.com:25585"],
+  brokers: [process.env.KAFKA_BROKER_URL],
   ssl: {
-    ca: [fs.readFileSync(path.join(__dirname, "kafka.pem"), "utf-8")],
+    ca: [fs.readFileSync(process.env.KAFKA_CA_PATH, "utf-8")],
   },
   sasl: {
-    username: "avnadmin",
-    password: "AVNS_ZAi0ZtcP6bM3Lja8TZn",
+    username: process.env.KAFKA_USERNAME,
+    password: process.env.KAFKA_PASSWORD,
     mechanism: "plain",
   },
 });
 
 const client = createClient({
-  host: "https://clickhouse-b9a0987-aadityadeopandeyy-3721.j.aivencloud.com:25573",
-  database: "default",
-  username: "avnadmin",
-  password: "AVNS_Lgoi6tYs0RoS-6dUUk6",
+  host: process.env.CLICKHOUSE_HOST,
+  database: process.env.CLICKHOUSE_DATABASE,
+  username: process.env.CLICKHOUSE_USERNAME,
+  password: process.env.CLICKHOUSE_PASSWORD,
 });
 
 const consumer = kafka.consumer({ groupId: "api-server-logs-consumer" });
@@ -49,19 +50,21 @@ io.on("connection", (socket) => {
     socket.emit("message", JSON.stringify({ log: `Subscribed to ${channel}` }));
   });
 });
-io.listen(9002, () => console.log("Socket server running on port 9002"));
+io.listen(SOCKET_PORT, () =>
+  console.log(`Socket server running on port ${SOCKET_PORT}`)
+);
 
 const ecsClient = new ECSClient({
-  region: "eu-north-1",
+  region: process.env.AWS_REGION,
   credentials: {
-    accessKeyId: "AKIAVRUVRCIGEXMLYEH4",
-    secretAccessKey: "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",
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
   },
 });
 
 const config = {
-  CLUSTER: "arn:aws:ecs:eu-north-1:381491941900:cluster/build-cluster",
-  TASK: "arn:aws:ecs:eu-north-1:381491941900:task-definition/builder-task",
+  CLUSTER: process.env.CLUSTER,
+  TASK: process.env.TASK,
 };
 
 app.post("/project", async (req, res) => {
@@ -71,17 +74,21 @@ app.post("/project", async (req, res) => {
   });
   const safeParseResult = schema.safeParse(req.body);
   if (safeParseResult.error) {
-    return res.status(400).json({ error: safeParseResult });
+    return res.status(400).json({ error: safeParseResult.error });
   }
   const { name, gitUrl } = safeParseResult.data;
-  const project = await prisma.project.create({
-    data: {
-      name,
-      gitUrl,
-      subDomain: generateSlug(),
-    },
-  });
-  return res.json({ status: "success", data: { project } });
+  try {
+    const project = await prisma.project.create({
+      data: {
+        name,
+        gitUrl,
+        subDomain: generateSlug(),
+      },
+    });
+    return res.json({ status: "success", data: { project } });
+  } catch (error) {
+    return res.status(500).json({ error: "Failed to create project" });
+  }
 });
 
 app.post("/deploy", async (req, res) => {
@@ -91,64 +98,70 @@ app.post("/deploy", async (req, res) => {
     return res.status(404).json({ error: "project not found" });
   }
 
-  const deployment = await prisma.deployment.create({
-    data: {
-      project: { connect: { id: projectId } },
-      status: "QUEUED",
-    },
-  });
-
-  const command = new RunTaskCommand({
-    cluster: config.CLUSTER,
-    taskDefinition: config.TASK,
-    launchType: "FARGATE",
-    count: 1,
-    networkConfiguration: {
-      awsvpcConfiguration: {
-        assignPublicIp: "ENABLED",
-        subnets: [
-          "subnet-041d6ffd53188d1a4",
-          "subnet-00ca2bf478a1df842",
-          "subnet-06eecc00b8efaa588",
-        ],
-        securityGroups: ["sg-0c4a705d717cbcadf"],
+  try {
+    const deployment = await prisma.deployment.create({
+      data: {
+        project: { connect: { id: projectId } },
+        status: "QUEUED",
       },
-    },
-    overrides: {
-      containerOverrides: [
-        {
-          name: "builder-image",
-          environment: [
-            { name: "GIT_REPOSITORY__URL", value: project.gitUrl },
-            { name: "PROJECT_ID", value: projectId },
-            { name: "DEPLOYMENT_ID", value: deployment.id },
-          ],
+    });
+
+    const command = new RunTaskCommand({
+      cluster: config.CLUSTER,
+      taskDefinition: config.TASK,
+      launchType: "FARGATE",
+      count: 1,
+      networkConfiguration: {
+        awsvpcConfiguration: {
+          assignPublicIp: "ENABLED",
+          subnets: process.env.SUBNETS.split(","),
+          securityGroups: process.env.SECURITY_GROUPS.split(","),
         },
-      ],
-    },
-  });
+      },
+      overrides: {
+        containerOverrides: [
+          {
+            name: "builder-image",
+            environment: [
+              { name: "GIT_REPOSITORY_URL", value: project.gitUrl },
+              { name: "PROJECT_ID", value: projectId },
+              { name: "DEPLOYMENT_ID", value: deployment.id },
+            ],
+          },
+        ],
+      },
+    });
 
-  await ecsClient.send(command);
+    await ecsClient.send(command);
 
-  return res.json({
-    status: "queued",
-    data: { deploymentId: deployment.id },
-  });
+    return res.json({
+      status: "queued",
+      data: { deploymentId: deployment.id },
+    });
+  } catch (error) {
+    return res.status(500).json({ error: "Failed to queue deployment" });
+  }
 });
+
 app.get("/logs/:id", async (req, res) => {
   const id = req.params.id;
-  const logs = await client.query({
-    query: `SELECT event_id, deployment_id, log, timestamp from log_events where deployment_id = {deployment_id:String}`,
-    query_params: {
-      deployment_id: id,
-    },
-    format: "JSONEachRow",
-  });
+  try {
+    const logs = await client.query({
+      query: `SELECT event_id, deployment_id, log, timestamp from log_events where deployment_id = {deployment_id:String}`,
+      query_params: {
+        deployment_id: id,
+      },
+      format: "JSONEachRow",
+    });
 
-  const rawLogs = await logs.json();
+    const rawLogs = await logs.json();
 
-  return res.json({ logs: rawLogs });
+    return res.json({ logs: rawLogs });
+  } catch (error) {
+    return res.status(500).json({ error: "Failed to retrieve logs" });
+  }
 });
+
 async function initKafkaConsumer() {
   console.log("Initializing Kafka consumer...");
   await consumer.connect();

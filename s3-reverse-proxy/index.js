@@ -22,7 +22,7 @@ app.use((req, res) => {
   const subdomain = hostName.split(".")[0];
   const resolvesTo = `${BASE_PATH}/${subdomain}`;
 
-  // console.log(`Proxying request to: ${resolvesTo}${req.url}`); // Log the target URL for debugging
+  // console.log(`Proxying request to: ${resolvesTo}${req.url}`);
 
   return proxy.web(
     req,
